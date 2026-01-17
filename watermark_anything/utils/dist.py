@@ -146,7 +146,13 @@ def init_distributed_mode(params):
         params.global_rank = int(os.environ["RANK"])
         params.world_size = int(os.environ['WORLD_SIZE'])
         params.local_rank = int(os.environ['LOCAL_RANK'])
-        params.n_gpu_per_node = int(os.environ['CUDA_VISIBLE_DEVICES'].count(',') + 1)
+        # Get number of GPUs per node from CUDA_VISIBLE_DEVICES if available, otherwise use world_size
+        cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+        if cuda_visible_devices:
+            params.n_gpu_per_node = int(cuda_visible_devices.count(',') + 1)
+        else:
+            # If CUDA_VISIBLE_DEVICES is not set, assume single node with all GPUs
+            params.n_gpu_per_node = params.world_size
         params.n_nodes = params.world_size // params.n_gpu_per_node
         params.node_id = params.global_rank // params.n_gpu_per_node
 

@@ -54,7 +54,8 @@ def get_dataloader(
     transform: callable = default_transform,
     batch_size: int = 128,
     shuffle: bool = True,
-    num_workers: int = 8
+    num_workers: int = 8,
+    prefetch_factor: int = 4
 ) -> DataLoader:
     """ Get dataloader for the images in the data_dir. The data_dir must be of the form: input/0/... """
     dataset = ImageFolder(data_dir, transform=transform)
@@ -62,11 +63,13 @@ def get_dataloader(
         sampler = DistributedSampler(dataset, shuffle=shuffle) 
         dataloader = DataLoader(dataset, batch_size=batch_size, 
                                 sampler=sampler, num_workers=num_workers, 
-                                pin_memory=True, drop_last=True)
+                                pin_memory=True, drop_last=True,
+                                prefetch_factor=prefetch_factor, persistent_workers=True if num_workers > 0 else False)
     else:
         dataloader = DataLoader(dataset, batch_size=batch_size, 
                                 shuffle=shuffle, num_workers=num_workers, 
-                                pin_memory=True, drop_last=True)
+                                pin_memory=True, drop_last=True,
+                                prefetch_factor=prefetch_factor, persistent_workers=True if num_workers > 0 else False)
     return dataloader
 
 
@@ -186,7 +189,8 @@ def get_dataloader_segmentation(
     num_workers: int = 8,
     random_nb_object = True,
     multi_w=False,
-    max_nb_masks = 4
+    max_nb_masks = 4,
+    prefetch_factor: int = 4
 ) -> DataLoader:
     """ Get dataloader for COCO dataset. """
     # Initialize the CocoDetection dataset
@@ -194,8 +198,8 @@ def get_dataloader_segmentation(
 
     if is_dist_avail_and_initialized():
         sampler = DistributedSampler(dataset, shuffle=shuffle)
-        dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers, pin_memory=True, drop_last=True, collate_fn=custom_collate)
+        dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers, pin_memory=True, drop_last=True, collate_fn=custom_collate, prefetch_factor=prefetch_factor, persistent_workers=True if num_workers > 0 else False)
     else:
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True, drop_last=True, collate_fn=custom_collate)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True, drop_last=True, collate_fn=custom_collate, prefetch_factor=prefetch_factor, persistent_workers=True if num_workers > 0 else False)
     
     return dataloader

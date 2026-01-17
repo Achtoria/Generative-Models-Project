@@ -50,6 +50,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 from torchvision import transforms
 from torchvision.utils import save_image
 from torchvision.datasets import CocoDetection
@@ -63,12 +64,20 @@ from watermark_anything.data.loader import get_dataloader, get_dataloader_segmen
 from watermark_anything.data.metrics import accuracy, psnr, iou, bit_accuracy, bit_accuracy_inference
 from watermark_anything.losses.detperceptual import LPIPSWithDiscriminator
 from watermark_anything.modules.jnd import JND
+from watermark_anything.modules.diff_jpeg import DiffJPEG
 from watermark_anything.utils.image import create_diff_img, detect_wm_hm, create_fixed_color_palette, masks_to_colored_image
 
 import watermark_anything.utils as utils
 import watermark_anything.utils.dist as udist
 import watermark_anything.utils.optim as uoptim
 import watermark_anything.utils.logger as ulogger
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not available. Install with: pip install wandb")
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -109,7 +118,10 @@ def get_parser():
     aa('--batch_size', default=16, type=int, help='Batch size')
     aa('--batch_size_eval', default=64, type=int, help='Batch size for evaluation')
     aa('--temperature', default=1.0, type=float, help='Temperature for the mask loss')
-    aa('--workers', default=8, type=int, help='Number of data loading workers')
+    aa('--workers', default=16, type=int, help='Number of data loading workers')
+    aa('--prefetch_factor', default=4, type=int, help='Number of batches prefetched by each worker')
+    aa('--use_amp', type=utils.bool_inst, default=True, help='Use Automatic Mixed Precision for faster training')
+    aa('--compile_model', type=utils.bool_inst, default=False, help='Use torch.compile() to optimize model (requires PyTorch 2.0+)')
     aa('--resume_from', default=None, type=str, help='Path to the checkpoint to resume from')
     aa('--to_freeze_embedder', default=None, type=str, help='What parts of the embedder to freeze')
 
@@ -127,6 +139,10 @@ def get_parser():
     group = parser.add_argument_group('Misc.')
     aa('--only_eval', type=utils.bool_inst, default=False, help='If True, only runs evaluate')
     aa('--eval_freq', default=5, type=int, help='Frequency for evaluation')
+    aa('--use_wandb', type=utils.bool_inst, default=False, help='Use Weights & Biases for logging')
+    aa('--wandb_project', type=str, default='watermark-anything', help='W&B project name')
+    aa('--wandb_name', type=str, default=None, help='W&B run name (default: output_dir name)')
+    aa('--wandb_log_images', type=utils.bool_inst, default=False, help='Log images to W&B (can be slow)')
     aa("--roll_probability", type=float, default=0, help="probability to inpaint betweem images of each batch.")
     aa("--multiple_w", type=float, default=0, help="probability to use 2 watermarks instead of 1.")
     aa("--eval_multiple_w", type=utils.bool_inst, default=False, help="evaluate with multiple watermarks.")
@@ -162,12 +178,24 @@ def main(params):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     if params.distributed:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = False  # Set to False for better performance
+        torch.backends.cudnn.benchmark = True  # Enable cuDNN benchmark for better performance
 
     # Print the current git commit and parameters
     print("__git__:{}".format(utils.get_sha()))
     print("__log__:{}".format(json.dumps(vars(params))))
+
+    # Initialize wandb if enabled and available
+    if params.use_wandb and WANDB_AVAILABLE and udist.is_main_process():
+        wandb_name = params.wandb_name if params.wandb_name else os.path.basename(params.output_dir.rstrip('/'))
+        wandb.init(
+            project=params.wandb_project,
+            name=wandb_name,
+            config=vars(params),
+            dir=params.output_dir,
+            resume='allow'
+        )
+        print(f"✅ Wandb initialized: project={params.wandb_project}, name={wandb_name}")
 
     # Copy configuration files to the output directory
     if udist.is_main_process():
@@ -250,6 +278,12 @@ def main(params):
         **optim_params_d
     )
     print('optimizer_d: %s' % optimizer_d)
+    
+    # Setup mixed precision training
+    use_amp = params.use_amp and torch.cuda.is_available()
+    scaler = GradScaler() if use_amp else None
+    if use_amp:
+        print('Using Automatic Mixed Precision (AMP) for training')
 
     # Data loaders for training and validation
     train_transform, train_mask_transform, val_transform, val_mask_transform = get_transforms_segmentation(params.img_size)
@@ -259,32 +293,37 @@ def main(params):
             params.train_dir, params.train_annotation_file, 
             transform=train_transform, mask_transform=train_mask_transform,
             batch_size=params.batch_size, 
-            num_workers=params.workers, shuffle=False, multi_w=params.multiple_w > 0
+            num_workers=params.workers, shuffle=False, multi_w=params.multiple_w > 0,
+            prefetch_factor=params.prefetch_factor
         )
         val_loader = get_dataloader_segmentation(
             params.val_dir, params.val_annotation_file, 
             transform=val_transform, mask_transform=val_mask_transform,
             batch_size=params.batch_size_eval, 
-            num_workers=params.workers, shuffle=False, random_nb_object=False, multi_w=False
+            num_workers=params.workers, shuffle=False, random_nb_object=False, multi_w=False,
+            prefetch_factor=params.prefetch_factor
         )
         val_loader_multi_wm = get_dataloader_segmentation(
             params.val_dir, params.val_annotation_file, 
             transform=val_transform, mask_transform=val_mask_transform,
             batch_size=params.batch_size_eval, 
-            num_workers=params.workers, shuffle=False, random_nb_object=False, multi_w=True, max_nb_masks=params.nb_wm_eval
+            num_workers=params.workers, shuffle=False, random_nb_object=False, multi_w=True, max_nb_masks=params.nb_wm_eval,
+            prefetch_factor=params.prefetch_factor
         )
     else:
         train_loader = get_dataloader(
             params.train_dir, 
             transform=train_transform,
             batch_size=params.batch_size, 
-            num_workers=params.workers, shuffle=True
+            num_workers=params.workers, shuffle=True,
+            prefetch_factor=params.prefetch_factor
         )
         val_loader = get_dataloader(
             params.val_dir,
             transform=val_transform,
             batch_size=params.batch_size_eval, 
-            num_workers=params.workers, shuffle=False
+            num_workers=params.workers, shuffle=False,
+            prefetch_factor=params.prefetch_factor
         )
         val_loader_multi_wm = get_dataloader(
             params.val_dir,                                
@@ -294,11 +333,46 @@ def main(params):
         )
 
     # Optionally resume training from a checkpoint
+    # Optionally resume training from a checkpoint (Partial Loading for Finetuning)
     if params.resume_from is not None: 
-        uoptim.restart_from_checkpoint(
-            params.resume_from,
-            model=wam,
-        )
+        print(f"Restoring Extractor weights from {params.resume_from}...")
+        checkpoint = torch.load(params.resume_from, map_location='cpu')
+        
+        # WAM 的 checkpoint 通常把权重存在 'model' 键下
+        src_state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+        tgt_state_dict = wam.state_dict()
+        
+        new_state_dict = {}
+        
+        for k, v in src_state_dict.items():
+            # 处理可能存在的 DDP 'module.' 前缀差异
+            if k.startswith('module.') and not list(tgt_state_dict.keys())[0].startswith('module.'):
+                k = k[7:]
+            
+            # 1. 核心：加载 Detector (Extractor)
+            if k.startswith('detector.'):
+                if k in tgt_state_dict and v.shape == tgt_state_dict[k].shape:
+                    new_state_dict[k] = v
+                else:
+                    print(f"⚠️ Shape mismatch for {k}, skipping.")
+            
+            # 2. 加载 Augmenter (通常是 mask 生成网络，如果有的话)
+            elif k.startswith('augmenter.'):
+                if k in tgt_state_dict and v.shape == tgt_state_dict[k].shape:
+                    new_state_dict[k] = v
+            
+            # 3. 明确跳过 Embedder (架构已修改为 CBN，无法复用)
+            elif k.startswith('embedder.'):
+                continue 
+            
+            # 4. 加载其他匹配的参数 (如 scaling_i 等标量)
+            elif k in tgt_state_dict and v.shape == tgt_state_dict[k].shape:
+                new_state_dict[k] = v
+
+        # 使用 strict=False 加载，允许 Embedder 权重缺失
+        missing, unexpected = wam.load_state_dict(new_state_dict, strict=False)
+        print(f"✅ Successfully loaded {len(new_state_dict)} keys (Extractor & Augmenter).")
+        print(f"ℹ️  Missing keys (Expected, as Embedder is initialized from scratch): {len(missing)}")
     to_restore = {"epoch": 0}
     uoptim.restart_from_checkpoint(
         os.path.join(params.output_dir, "checkpoint.pth"),
@@ -315,11 +389,28 @@ def main(params):
         param_group['lr'] = optim_params_d['lr']
     optimizers = [optimizer, optimizer_d]
 
+    # Optionally compile model for better performance (PyTorch 2.0+)
+    if params.compile_model and hasattr(torch, 'compile'):
+        print('Compiling model with torch.compile()...')
+        wam = torch.compile(wam, mode='reduce-overhead')
+        print('Model compiled successfully')
+    
     # Setup for distributed training if applicable
     if params.distributed:
-        wam_ddp = nn.parallel.DistributedDataParallel(wam, device_ids=[params.local_rank])
+        # Optimize DDP settings for better performance
+        wam_ddp = nn.parallel.DistributedDataParallel(
+            wam, 
+            device_ids=[params.local_rank],
+            find_unused_parameters=False,  # Set to False for better performance if all parameters are used
+            gradient_as_bucket_view=True,  # Optimize gradient communication
+            static_graph=True  # Enable static graph optimization if model structure doesn't change
+        )
         image_detection_loss.discriminator = nn.parallel.DistributedDataParallel(
-            image_detection_loss.discriminator, device_ids=[params.local_rank]
+            image_detection_loss.discriminator, 
+            device_ids=[params.local_rank],
+            find_unused_parameters=False,
+            gradient_as_bucket_view=True,
+            static_graph=True
         )
     else:
         wam_ddp = wam
@@ -376,9 +467,36 @@ def main(params):
     start_time = time.time()
     for epoch in range(start_epoch, params.epochs):
         log_stats = {'epoch': epoch}
-        # Step the scheduler and scaling scheduler if they exist
+        
+        # ==========================================
+        # 【修复】正确的冻结策略逻辑 (兼容 DDP 和 单卡)
+        # ==========================================
+        FREEZE_EPOCHS = 5
+        
+        # 获取实际的模型对象 (自动处理 DDP 包裹)
+        real_model = wam_ddp.module if params.distributed else wam_ddp
+        
+        if epoch < FREEZE_EPOCHS:
+            if udist.is_main_process() and epoch == 0:
+                print(f"❄️  Warm-up: Freezing Extractor for {FREEZE_EPOCHS} epochs.")
+            real_model.detector.eval() 
+            for param in real_model.detector.parameters():
+                param.requires_grad = False
+        elif epoch == FREEZE_EPOCHS:
+            if udist.is_main_process():
+                print(f"🔥 Warm-up finished: Unfreezing Extractor. Joint training starts.")
+            real_model.detector.train()
+            for param in real_model.detector.parameters():
+                param.requires_grad = True
+        else:
+            # 确保处于训练模式
+            real_model.detector.train()
+        # ==========================================
+
+        # Step the scheduler...
         if scheduler is not None:
             scheduler.step(epoch)
+
         print(f'Epoch {epoch} - scaling_w: {wam.scaling_w}')
         # Set epoch for distributed data loaders
         if params.distributed:
@@ -386,7 +504,7 @@ def main(params):
             val_loader.sampler.set_epoch(epoch)
             val_loader_multi_wm.sampler.set_epoch(epoch)
         # Train for one epoch
-        train_stats = train_one_epoch(wam_ddp, optimizers, train_loader, image_detection_loss, epoch, color_palette, params)
+        train_stats = train_one_epoch(wam_ddp, optimizers, train_loader, image_detection_loss, epoch, color_palette, params, scaler)
         log_stats = {**log_stats, **{f'train_{k}': v for k, v in train_stats.items()}}
         # Evaluate periodically
         if epoch % params.eval_freq == 0:
@@ -397,6 +515,9 @@ def main(params):
         if udist.is_main_process():
             with open(os.path.join(params.output_dir, 'log.txt'), 'a') as f:
                 f.write(json.dumps(log_stats) + "\n")
+            # Log to wandb
+            if params.use_wandb and WANDB_AVAILABLE:
+                wandb.log(log_stats, step=epoch)
         # Save checkpoints
         save_dict = {
             'epoch': epoch + 1,
@@ -412,6 +533,10 @@ def main(params):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Total time {}'.format(total_time_str))
+    
+    # Finish wandb run
+    if params.use_wandb and WANDB_AVAILABLE and udist.is_main_process():
+        wandb.finish()
 
 
 def train_one_epoch(
@@ -422,14 +547,14 @@ def train_one_epoch(
     epoch: int,
     color_palette: torch.Tensor,
     params: argparse.Namespace,
+    scaler: GradScaler = None,
 ):
-    """
-    Train the model for one epoch. This function handles the forward pass, loss computation, 
-    backpropagation, and logging of metrics for each batch in the training data loader.
-    """
-
     # Set the model to training mode
     wam.train()
+    
+    # 【新增】初始化 DiffJPEG (确保在 device 上)
+    # 使用 Quality 50 作为较强的增强
+    jpeg_layer = DiffJPEG(quality=50).to(device)
 
     header = 'Train - Epoch: [{}/{}]'.format(epoch, params.epochs)
     metric_logger = ulogger.MetricLogger(delimiter="  ")
@@ -441,26 +566,46 @@ def train_one_epoch(
         # Move images to the appropriate device
         imgs = imgs.to(device, non_blocking=True)
     
-        # Forward pass through the model
-        outputs = wam(imgs, masks, no_overlap=params.multiple_w > 0, params=params)
-        outputs["preds"] /= params.temperature
-        
-        # Determine the last layer of the embedder model based on its type
-        last_layer = wam.embedder.get_last_layer() if not params.distributed else wam.module.embedder.get_last_layer()
-
-        # Iterate over optimizers for different parts of the model
-        for optimizer_idx in [1, 0]:
-            # Compute loss and logs
-            loss, logs = image_detection_loss(
-                imgs, outputs["imgs_w"], 
-                outputs["masks"], outputs["msgs"], outputs["preds"], 
-                optimizer_idx, epoch, 
-                last_layer=last_layer
+        # Forward pass through the model with mixed precision
+        use_amp = scaler is not None
+        with autocast(enabled=use_amp):
+            # 【核心修改】
+            # 随机决定是否应用 JPEG 攻击 (例如 50% 概率)
+            # 重点是让 Embedding 层通过这个可导层接收梯度
+            apply_jpeg = random.random() < 0.5
+            
+            # 将 jpeg_layer 传给 wam.forward
+            outputs = wam(
+                imgs, 
+                masks, 
+                no_overlap=params.multiple_w > 0, 
+                params=params,
+                attack_module=jpeg_layer if apply_jpeg else None # 传入攻击模块
             )
-            # Zero gradients, backpropagate, and update weights
-            optimizers[optimizer_idx].zero_grad()
-            loss.backward()
-            optimizers[optimizer_idx].step()
+            
+            outputs["preds"] /= params.temperature
+            
+            last_layer = wam.embedder.get_last_layer() if not params.distributed else wam.module.embedder.get_last_layer()
+
+            # Iterate over optimizers for different parts of the model
+            for optimizer_idx in [1, 0]:
+                loss, logs = image_detection_loss(
+                    imgs, outputs["imgs_w"], 
+                    outputs["masks"], outputs["msgs"], outputs["preds"], 
+                    optimizer_idx, epoch, 
+                    last_layer=last_layer
+                )
+                optimizers[optimizer_idx].zero_grad()
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizers[optimizer_idx])
+                else:
+                    loss.backward()
+                    optimizers[optimizer_idx].step()
+        
+        # Update scaler if using AMP
+        if use_amp:
+            scaler.update()
 
         # Log bit accuracy if applicable
         if params.nbits > 0:
@@ -497,9 +642,6 @@ def train_one_epoch(
         if params.nbits > 0:
             log_stats['bit_acc'] = bit_accuracy_
         
-        # Synchronize CUDA operations
-        torch.cuda.synchronize()
-        
         # Update metric logger with log statistics
         for name, loss in log_stats.items():
             metric_logger.update(**{name: loss})
@@ -516,6 +658,18 @@ def train_one_epoch(
             # Save predicted and target masks
             save_image(colored_masks.float(), os.path.join(params.output_dir, f'{epoch:03}_{it:03}_train_4_mask.png'), nrow=8)
             save_image(F.sigmoid(mask_preds / params.temperature), os.path.join(params.output_dir, f'{epoch:03}_{it:03}_train_5_pred.png'), nrow=8)
+            
+            # Log images to wandb if enabled
+            if params.use_wandb and WANDB_AVAILABLE and params.wandb_log_images:
+                wandb_images = {
+                    'train/original': wandb.Image(unnormalize_img(imgs[:8])),
+                    'train/watermarked': wandb.Image(unnormalize_img(outputs["imgs_w"][:8])),
+                    'train/diff': wandb.Image(create_diff_img(imgs[:8], outputs["imgs_w"][:8])),
+                    'train/augmented': wandb.Image(unnormalize_img(outputs["imgs_aug"][:8])),
+                    'train/mask_target': wandb.Image(colored_masks[:8].float()),
+                    'train/mask_pred': wandb.Image(F.sigmoid(mask_preds[:8] / params.temperature)),
+                }
+                wandb.log(wandb_images, step=epoch * len(train_loader) + it)
     # Synchronize metric logger across processes
     metric_logger.synchronize_between_processes()
     
@@ -687,9 +841,6 @@ def eval_full(
                             imgs_tosave.append(inverse_resize(F.sigmoid(mask_preds[idx]).repeat(3, 1, 1)).cpu())
                             tosave.remove(current_key)
         
-        # Synchronize CUDA operations
-        torch.cuda.synchronize()
-        
         # Update metric logger with augmentation metrics
         for name, loss in aug_metrics.items():
             if name == 'bit_acc' and math.isnan(loss):
@@ -701,6 +852,10 @@ def eval_full(
     if (epoch % params.saveimg_freq == 0 or params.only_eval) and udist.is_main_process():
         aux = "" if not params.only_eval else "_only_eval"
         save_image(torch.stack(imgs_tosave), os.path.join(params.output_dir, f'{epoch:03}_val_{eval_name}{aux}.png'), nrow=5)
+        
+        # Log validation images to wandb if enabled
+        if params.use_wandb and WANDB_AVAILABLE and params.wandb_log_images and len(imgs_tosave) > 0:
+            wandb.log({f'val_{eval_name}/samples': wandb.Image(torch.stack(imgs_tosave))}, step=epoch)
     # Synchronize metric logger across processes
     metric_logger.synchronize_between_processes()
     
@@ -853,9 +1008,6 @@ def eval_full_kwm(
                         imgs_tosave[name_mask][roll].append(combined_mask[idx if not roll else idx + 1].cpu().repeat(3, 1, 1))
                         imgs_tosave[name_mask][roll].append(F.sigmoid(mask_preds[idx]).cpu().repeat(3, 1, 1))
                 
-                # Synchronize CUDA operations
-                torch.cuda.synchronize()
-                
                 # Update metric logger with augmentation metrics
                 for name, loss in aug_metrics.items():
                     if name == 'bit_acc' and math.isnan(loss):
@@ -870,6 +1022,14 @@ def eval_full_kwm(
         for roll in [False, True]:
             save_image(torch.stack(imgs_tosave["segmentation"][roll]), os.path.join(params.output_dir, f'{epoch:03}_val_full{aux}_segmentation_roll={roll}.png'), nrow=6)
             save_image(torch.stack(imgs_tosave["rectangles"][roll]), os.path.join(params.output_dir, f'{epoch:03}_val_full{aux}_rectangles_roll={roll}.png'), nrow=6)
+            
+            # Log multi-wm images to wandb if enabled
+            if params.use_wandb and WANDB_AVAILABLE and params.wandb_log_images:
+                if len(imgs_tosave["segmentation"][roll]) > 0:
+                    wandb.log({
+                        f'val_multi_wm/segmentation_roll={roll}': wandb.Image(torch.stack(imgs_tosave["segmentation"][roll])),
+                        f'val_multi_wm/rectangles_roll={roll}': wandb.Image(torch.stack(imgs_tosave["rectangles"][roll])),
+                    }, step=epoch)
 
     metric_logger.synchronize_between_processes()
     print("Averaged {} stats:".format('val multi wm'), metric_logger)
