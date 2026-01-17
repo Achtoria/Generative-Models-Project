@@ -1,0 +1,38 @@
+# Core Framework
+torch>=2.1.0
+torchvision
+torchaudio
+numpy<2.0.0
+click
+python-dotenv
+tabulate
+tqdm
+scikit-image
+scikit-learn
+matplotlib
+pandas
+
+# WAM (Watermark-Anything) Dependencies
+opencv-python
+onnx
+onnxruntime-gpu
+# segment-anything is also required: pip install git+https://github.com/facebookresearch/segment-anything.git
+
+# WAVES Original Dependencies (Metrics & Models)
+omegaconf
+einops
+timm
+lpips
+pycocotools
+open_clip_torch
+scipy
+ftfy
+regex
+
+# Adversarial & Feature Space Dependencies (Pinned for compatibility)
+diffusers==0.26.2
+huggingface-hub==0.23.2
+transformers==4.35.2
+
+# Attack Engine
+torchattacks
