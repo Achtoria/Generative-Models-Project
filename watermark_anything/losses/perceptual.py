@@ -9,7 +9,7 @@ import torch.nn as nn
 from lpips import LPIPS
 
 from .ssim import SSIM, MSSSIM
-from .yuv import YUVLoss
+from .yuvloss import YUVLoss
 
 class NoneLoss(nn.Module):
     def forward(self, x, y):

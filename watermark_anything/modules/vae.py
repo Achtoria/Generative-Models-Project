@@ -19,6 +19,41 @@ def nonlinearity(x):
     # swish
     return x*torch.sigmoid(x)
 
+class ConditionalNorm(nn.Module):
+    """
+    Vestigit 风格的条件归一化层。
+    使用水印向量 (message_emb) 预测缩放 (gamma) 和偏移 (beta)。
+    """
+    def __init__(self, in_channels, message_dim, num_groups=32):
+        super().__init__()
+        # 使用 affine=False，因为我们要自己预测参数
+        self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=False)
+        
+        if message_dim > 0:
+            # 线性层：将消息向量映射为 2 * channels (gamma + beta)
+            self.embed = nn.Linear(message_dim, in_channels * 2)
+            # 初始化：让初始状态接近标准的 Identity (gamma=1, beta=0)
+            self.embed.weight.data[:, :in_channels].normal_(1, 0.02)
+            self.embed.weight.data[:, in_channels:].zero_()
+            self.embed.bias.data.zero_()
+        else:
+            self.embed = None
+            
+    def forward(self, x, message_vector):
+        out = self.norm(x)
+        
+        if self.embed is not None and message_vector is not None:
+            # 预测参数
+            style = self.embed(message_vector) # [B, 2*C]
+            gamma, beta = style.chunk(2, 1)    # [B, C], [B, C]
+            
+            # 调整维度以匹配特征图 [B, C, 1, 1]
+            gamma = gamma.unsqueeze(2).unsqueeze(3)
+            beta = beta.unsqueeze(2).unsqueeze(3)
+            
+            out = out * gamma + beta
+        return out
+
 def Normalize(in_channels, num_groups=32):
     return torch.nn.GroupNorm(num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=True)
 
@@ -75,36 +110,46 @@ class LinearAttention(nn.Module):
 
 
 class ResnetBlock(nn.Module):
-    def __init__(self, *, in_channels, out_channels=None, conv_shortcut=False, dropout, temb_channels=512):
+    # 【修改 1】 __init__ 增加 message_dim 参数
+    def __init__(self, *, in_channels, out_channels=None, conv_shortcut=False, dropout, temb_channels=512, message_dim=0):
         super().__init__()
         self.in_channels = in_channels
         out_channels = in_channels if out_channels is None else out_channels
         self.out_channels = out_channels
         self.use_conv_shortcut = conv_shortcut
 
-        self.norm1 = Normalize(in_channels)
+        # 【修改 2】 将 Normalize 替换为 ConditionalNorm
+        self.norm1 = ConditionalNorm(in_channels, message_dim)
         self.conv1 = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        
+        # 保留 temb 逻辑以兼容旧代码（如果不需要可以删掉）
         if temb_channels > 0:
             self.temb_proj = torch.nn.Linear(temb_channels, out_channels)
-        self.norm2 = Normalize(out_channels)
+        
+        # 【修改 3】 第二层也替换
+        self.norm2 = ConditionalNorm(out_channels, message_dim)
         self.dropout = torch.nn.Dropout(dropout)
         self.conv2 = torch.nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
                 self.conv_shortcut = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
             else:
                 self.nin_shortcut = torch.nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
-    def forward(self, x, temb):
+    # 【修改 4】 forward 增加 wm_emb 参数 (Watermark Embedding)
+    def forward(self, x, temb=None, wm_emb=None):
         h = x
-        h = self.norm1(h)
+        # 传入水印向量
+        h = self.norm1(h, wm_emb)
         h = nonlinearity(h)
         h = self.conv1(h)
 
         if temb is not None:
             h = h + self.temb_proj(nonlinearity(temb))[:,:,None,None]
 
-        h = self.norm2(h)
+        # 传入水印向量
+        h = self.norm2(h, wm_emb)
         h = nonlinearity(h)
         h = self.dropout(h)
         h = self.conv2(h)
@@ -189,7 +234,8 @@ class VAEEncoder(nn.Module):
         z_channels: int, 
         double_z: bool = True, 
         use_linear_attn: bool = False, 
-        attn_type: str = "vanilla", 
+        attn_type: str = "vanilla",
+        message_dim: int = 0,  # 【修改 1】 新增参数
         **ignore_kwargs
     ) -> None:
         super().__init__()
@@ -219,6 +265,13 @@ class VAEEncoder(nn.Module):
             block_in = ch*in_ch_mult[i_level]
             block_out = ch*ch_mult[i_level]
             for i_block in range(self.num_res_blocks):
+                # 【修改 2】 传入 message_dim
+                block.append(ResnetBlock(in_channels=block_in, out_channels=block_out, 
+                                         temb_channels=self.temb_ch, dropout=dropout, 
+                                         message_dim=message_dim))
+                block_in = block_out
+            block_out = ch*ch_mult[i_level]
+            for i_block in range(self.num_res_blocks):
                 block.append(ResnetBlock(in_channels=block_in, out_channels=block_out, temb_channels=self.temb_ch, dropout=dropout))
                 block_in = block_out
                 if curr_res in attn_resolutions:
@@ -233,23 +286,27 @@ class VAEEncoder(nn.Module):
 
         # middle
         self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in, temb_channels=self.temb_ch, dropout=dropout)
+        # 【修改 3】 Middle Block 也改
+        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in, 
+                                       temb_channels=self.temb_ch, dropout=dropout, 
+                                       message_dim=message_dim)
         self.mid.attn_1 = make_attn(block_in, attn_type=attn_type)
-        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in, temb_channels=self.temb_ch, dropout=dropout)
+        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in, 
+                                       temb_channels=self.temb_ch, dropout=dropout, 
+                                       message_dim=message_dim)
 
         # end
         self.norm_out = Normalize(block_in)
         self.conv_out = torch.nn.Conv2d(block_in, 2*z_channels if double_z else z_channels, kernel_size=3, stride=1, padding=1)
 
-    def forward(self, x):
-        # timestep embedding
-        temb = None
+    def forward(self, x, wm_emb=None):
+        temb = None 
 
-        # downsampling
         hs = [self.conv_in(x)]
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
-                h = self.down[i_level].block[i_block](hs[-1], temb)
+                # 【修改 5】 传入 wm_emb
+                h = self.down[i_level].block[i_block](hs[-1], temb, wm_emb=wm_emb)
                 if len(self.down[i_level].attn) > 0:
                     h = self.down[i_level].attn[i_block](h)
                 hs.append(h)
@@ -258,12 +315,12 @@ class VAEEncoder(nn.Module):
 
         # middle
         h = hs[-1]
-        h = self.mid.block_1(h, temb)
+        h = self.mid.block_1(h, temb, wm_emb=wm_emb) # 【修改 6】
         h = self.mid.attn_1(h)
-        h = self.mid.block_2(h, temb)
+        h = self.mid.block_2(h, temb, wm_emb=wm_emb) # 【修改 7】
 
         # end
-        h = self.norm_out(h)
+        h = self.norm_out(h) # 注意：这里的 norm_out 还是原来的 GroupNorm，如果需要也可以改成 Conditional
         h = nonlinearity(h)
         h = self.conv_out(h)
         return h
@@ -273,7 +330,7 @@ class VAEDecoder(nn.Module):
     def __init__(
         self, 
         *, 
-        ch: int, 
+        ch: int,  
         out_ch: int, 
         ch_mult: tuple[int, int, int, int] = (1,2,4,8), 
         num_res_blocks: int, 
@@ -288,6 +345,7 @@ class VAEDecoder(nn.Module):
         use_linear_attn: bool = False, 
         attn_type: str = "vanilla", 
         bw: bool = False,
+        message_dim: int = 0, # 【修改 1】
         **ignore_kwargs
     ) -> None:
         super().__init__()
@@ -317,9 +375,14 @@ class VAEDecoder(nn.Module):
 
         # middle
         self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in, temb_channels=self.temb_ch, dropout=dropout)
+        # 【修改 2】 传入 message_dim
+        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in, 
+                                       temb_channels=self.temb_ch, dropout=dropout, 
+                                       message_dim=message_dim)
         self.mid.attn_1 = make_attn(block_in, attn_type=attn_type)
-        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in, temb_channels=self.temb_ch, dropout=dropout)
+        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in, 
+                                       temb_channels=self.temb_ch, dropout=dropout, 
+                                       message_dim=message_dim)
 
         # upsampling
         self.up = nn.ModuleList()
@@ -328,7 +391,10 @@ class VAEDecoder(nn.Module):
             attn = nn.ModuleList()
             block_out = ch*ch_mult[i_level]
             for i_block in range(self.num_res_blocks+1):
-                block.append(ResnetBlock(in_channels=block_in, out_channels=block_out, temb_channels=self.temb_ch, dropout=dropout))
+                # 【修改 3】 传入 message_dim
+                block.append(ResnetBlock(in_channels=block_in, out_channels=block_out, 
+                                         temb_channels=self.temb_ch, dropout=dropout,
+                                         message_dim=message_dim))
                 block_in = block_out
                 if curr_res in attn_resolutions:
                     attn.append(make_attn(block_in, attn_type=attn_type))
@@ -344,25 +410,22 @@ class VAEDecoder(nn.Module):
         self.norm_out = Normalize(block_in)
         self.conv_out = torch.nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1)
 
-    def forward(self, z):
-        #assert z.shape[1:] == self.z_shape[1:]
-        self.last_z_shape = z.shape
-
-        # timestep embedding
+    # 【修改 4】 forward 增加 wm_emb
+    def forward(self, z, wm_emb=None):
         temb = None
 
-        # z to block_in
         h = self.conv_in(z)
 
         # middle
-        h = self.mid.block_1(h, temb)
+        h = self.mid.block_1(h, temb, wm_emb=wm_emb) # 【修改 5】
         h = self.mid.attn_1(h)
-        h = self.mid.block_2(h, temb)
+        h = self.mid.block_2(h, temb, wm_emb=wm_emb) # 【修改 6】
 
         # upsampling
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks+1):
-                h = self.up[i_level].block[i_block](h, temb)
+                # 【修改 7】
+                h = self.up[i_level].block[i_block](h, temb, wm_emb=wm_emb)
                 if len(self.up[i_level].attn) > 0:
                     h = self.up[i_level].attn[i_block](h)
             if i_level != 0:
