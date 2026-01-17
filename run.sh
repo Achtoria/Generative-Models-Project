@@ -16,7 +16,7 @@ python -m torch.distributed.run --nproc_per_node=8 train.py \
     --extractor_model sam_base \
     --embedder_model vae_small \
     --img_size 256 \
-    --batch_size 16 \
+    --batch_size 32 \
     --batch_size_eval 32 \
     --epochs 100 \
     --optimizer "AdamW,lr=1e-4" \
@@ -33,4 +33,5 @@ python -m torch.distributed.run --nproc_per_node=8 train.py \
     --resume_from /home/guantianrui/watermark-anything/checkpoints/wam_mit.pth \
     --train_dir  /share_data/guantianrui/datasets/COCO/train2017 --train_annotation_file  /share_data/guantianrui/datasets/COCO/annotations/instances_train2017.json \
     --val_dir /share_data/guantianrui/datasets/COCO/val2017 --val_annotation_file /share_data/guantianrui/datasets/COCO/annotations/instances_val2017.json \
-    --use_wandb True
+    --use_wandb True \
+    --compile_model False

@@ -4,3 +4,4 @@ output
 outputs
 *.pth
 torchrun --nproc_per_node=8 train.sh
+output_finetune
